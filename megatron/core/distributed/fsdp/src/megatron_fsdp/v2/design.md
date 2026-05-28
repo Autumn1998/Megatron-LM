@@ -7,10 +7,10 @@
 | File | Role in overlap |
 |---|---|
 | `fully_shard.py` | Public `fully_shard()` API and allocator selection |
-| `fsdp_module.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, `unshard()`, `reshard()`, `reduce_scatter_grad()` |
+| `fsdp_module.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, `unshard()`, `reshard()`, `reduce_grad()` |
 | `hooks.py` | Forward/backward hook registration and final callback |
-| `param_group.py` | `ParameterGroup.unshard(async_op)`, `reduce_scatter_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
-| `dp_buffer.py` | `DataParallelBuffer.unshard(async_op)` (all-gather + `p.data` rebind), `reduce_scatter_grad()` (reduce-scatter + shard accumulation) |
+| `param_group.py` | `ParameterGroup.unshard()`, `reduce_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
+| `dp_buffer.py` | `DataParallelBuffer.unshard()` (all-gather + `p.data` rebind), `reduce_grad()` (reduce-scatter + shard accumulation) |
 | `allocator.py` | `BucketAllocator` hierarchy: `TemporaryBucketAllocator`, `StorageFreeingBucketAllocator`, `TracePoolAllocator` — pooled memory for unsharded parameter and gradient buffers |
 | `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes ag_stream and rs_stream into main stream |
 
@@ -47,7 +47,7 @@ class _FSDPRootContext:
     # None means "not yet launched" or "already consumed by a wait".
 
     # --- Reduce-scatter grad overlap tracking ---
-    reduce_scatter_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, ParameterGroup]]]
+    reduce_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, ParameterGroup]]]
     # module_id -> [(event, param_group), ...]
     # Each entry: event signals RS complete; param_group holds the grad buffer.
 
@@ -93,7 +93,7 @@ root_context = _FSDPRootContext(
     rs_stream=torch.cuda.Stream() if enable_async_reduce_grad else torch.cuda.current_stream(),
     bucket_allocator=bucket_allocator,
     forward_order=forward_order,
-    reduce_scatter_grad_buckets={id(m): [] for m in forward_order},
+    reduce_grad_buckets={id(m): [] for m in forward_order},
     unshard_done_events={id(m): None for m in forward_order},
     enable_unshard_prefetch=enable_unshard_prefetch,
     enable_async_reduce_grad=enable_async_reduce_grad,
@@ -114,7 +114,7 @@ dynamic recording phase.
 **Safety constraint.** `_init_fsdp_state()` must be called **before** any forward/backward pass
 runs.  The method includes a runtime guard that rejects re-initialization if any child
 FSDPModule is still unsharded (`unshard_done_events` live) or has pending reduce-scatter
-operations (`reduce_scatter_grad_buckets` non-empty).  Violating this constraint would overwrite a
+operations (`reduce_grad_buckets` non-empty).  Violating this constraint would overwrite a
 running module's `_fsdp_root_context` while its hooks are still firing, causing undefined
 behavior.
 
@@ -159,8 +159,9 @@ for module in [self] + prefetch:
         for _, param_group in module._named_param_groups:
             param_group.unshard()
             # → DataParallelBuffer.unshard():
-            #     allocate unsharded bucket, launch all_gather_into_tensor,
-            #     rebind p.data → unsharded buffer slice (even before AG done!)
+            #     for sharded buffers, allocate an unsharded bucket, launch
+            #     all_gather_into_tensor, and rebind p.data → unsharded buffer slice
+            #     (even before AG done!); replicated buffers bind directly to self.data.
             # NOTE: async_op is NOT passed; the stream context handles dispatch.
 
     if async_op:
@@ -181,8 +182,8 @@ for param_names, param_group in self._named_param_groups:
 
 **Important: `p.data` rebind race.**
 `DataParallelBuffer.unshard()` rebinds `p.data` to the unsharded buffer slice
-**inside the `with torch.cuda.stream(stream)` block**, before the all-gather completes (when
-`async_op=True`). The memory is already allocated and the slice indices are correct; only the
+**inside the `with torch.cuda.stream(stream)` block**, before the all-gather completes when
+side-stream prefetch is enabled. The memory is already allocated and the slice indices are correct; only the
 NCCL fill is in-flight. The outer `unshard()` guards correctness by calling `event.wait()`
 before calling `_replace_module_parameter`, so the module's parameters are safe to read by
 the time the forward kernel uses them.
@@ -194,8 +195,8 @@ previous forward, or tensor-parallel slice updates) are fully visible to the all
 kernel. Without this barrier, stale or partially-written parameter shards may be read by
 the NCCL collective, causing convergence divergence.
 
-**NVTX profiling.** `unshard()`, `reshard()`, and `reduce_scatter_grad()` each push/pop a
-`torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_scatter_grad"`)
+**NVTX profiling.** `unshard()`, `reshard()`, and `reduce_grad()` each push/pop a
+`torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_grad"`)
 for profiling visibility in tools like Nsight Systems.
 
 Prefetched modules' data also becomes valid when their own pre-hook later calls `event.wait()`
@@ -234,11 +235,11 @@ Inside the `post_backward` closure registered by `_register_backward_hook`:
 
 ```python
 module.reshard()
-module.reduce_scatter_grad(async_op=ctx.enable_async_reduce_grad)
+module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
 module.post_backward_issued = True
 ```
 
-### `FSDPModule.reduce_scatter_grad(async_op)`
+### `FSDPModule.reduce_grad(async_op)`
 
 ```python
 stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
@@ -248,7 +249,7 @@ if async_op:
     backward_order = list(reversed(ctx.forward_order))
     for i, module in enumerate(backward_order):
         if i - 2 >= 0:
-            for event, param_group in drain(ctx.reduce_scatter_grad_buckets[id(backward_order[i-2])]):
+            for event, param_group in drain(ctx.reduce_grad_buckets[id(backward_order[i-2])]):
                 event.wait()
                 param_group.release_grad_buffer()
                 #   → deletes param.main_grad views (prevents TE grad-accum-fusion leak)
@@ -272,16 +273,16 @@ for param_names, param_group in self._named_param_groups:
     if async_op:
         stream.wait_stream(torch.cuda.current_stream())    # ensure .grad copy is visible to rs_stream
         with torch.cuda.stream(stream):
-            param_group.reduce_scatter_grad()
-            #   → DataParallelBuffer.reduce_scatter_grad() (synchronous within this stream):
+            param_group.reduce_grad()
+            #   → DataParallelBuffer.reduce_grad() (synchronous within this stream):
             #       fetch_unsharded_buffer() allocates full grad buffer
             #       reduce_scatter_tensor(output=grad_shard, input=full_grad)
             #       self.data[local_idx:...] += grad_shard
         event = stream.record_event()
-        ctx.reduce_scatter_grad_buckets[id(self)].append((event, param_group))
+        ctx.reduce_grad_buckets[id(self)].append((event, param_group))
         # param_group.release_grad_buffer() is NOT called here; deferred until drain/final CB
     else:
-        param_group.reduce_scatter_grad()
+        param_group.reduce_grad()
         param_group.release_grad_buffer()
 
     # --- Step 4: Install dist_grad on dist_param (runs in stream context) ---
@@ -294,7 +295,7 @@ for param_names, param_group in self._named_param_groups:
             setattr(dist_param, "grad", dist_grad)          # Python ref, no GPU dependency
 ```
 
-**Key design point — `DataParallelBuffer.reduce_scatter_grad()` has no `async_op` parameter.**
+**Key design point — `DataParallelBuffer.reduce_grad()` has no `async_op` parameter.**
 The operation is inherently synchronous *within whatever stream is current* when called. The
 "async" behavior is achieved entirely by the caller dispatching into `rs_stream` via
 `with torch.cuda.stream(stream)`. This avoids any API changes to `DataParallelBuffer`.
@@ -304,7 +305,7 @@ When TransformerEngine's `gradient_accumulation_fusion` is active, the backward 
 directly into `param.main_grad` (bypassing `.grad`). Two flags coordinate this:
 
 - **`grad_added_to_main_grad`**: Set to `False` in `pre_backward_hook` before each backward
-  pass; the kernel sets it to `True` after writing. In `reduce_scatter_grad`, the `zero_()` call is
+  pass; the kernel sets it to `True` after writing. In `reduce_grad`, the `zero_()` call is
   skipped when `True` to preserve the fused-gradient value.
 
 - **`overwrite_main_grad`**: Set to `True` in `pre_backward_hook` for sharded parameters
@@ -347,10 +348,10 @@ def _post_backward_final_callback(root_state, root_module):
         if module.post_backward_issued:
             continue
         module.reshard()
-        module.reduce_scatter_grad(async_op=ctx.enable_async_reduce_grad)
+        module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
 
     # Drain ALL remaining buckets (anything not drained by the sliding rule above)
-    for buckets in ctx.reduce_scatter_grad_buckets.values():
+    for buckets in ctx.reduce_grad_buckets.values():
         while buckets:
             event, param_group = buckets.pop()
             event.wait()
@@ -401,17 +402,21 @@ optimizer-facing DTensor shards through `dist_params`.
 
 ### Replicated Weight Refresh
 
-For ZeRO-1/2, `copy_main_weights_to_model_weights()` marks a parameter group
-stale when `main_weight_buffer` is sharded and `model_weight_buffer` is
-replicated. The next forward `unshard(bwd_pass=False)` calls
-`sync_replicated_buffer_from_shard()` before compute:
+For ZeRO-1/2, `copy_main_weights_to_model_weights()` sets
+`_needs_inplace_weight_unshard` when `main_weight_buffer` is sharded and
+`model_weight_buffer` is replicated. The next forward
+`ParameterGroup.unshard(bwd_pass=False)` adds inplace refresh entries to its
+`unshard_specs` and refreshes the replica before compute:
 
 1. Non-FP8 weights copy this rank's updated main-weight shard into the matching
-   slice of the replicated model-weight buffer when the buffer dtypes differ.
+   slice of the replicated model-weight buffer.
 2. FP8 weights quantize the local FP32 main-weight shard into the local FP8
    model-weight shard first; MXFP8 refreshes the transpose buffer as well.
-3. `all_gather_into_tensor` gathers the updated shards into the full replicated
-   compute buffer on every rank.
+3. `DataParallelBuffer.unshard(inplace=True, bind_params=...)` gathers the updated
+   shards directly into the full replicated compute buffer on every rank. The
+   same buffer may also have a normal `(inplace=False, bind_params=True)` spec;
+   that just binds params to `self.data`, and the inplace gather updates the same
+   storage afterward.
 
 Backward unshard does not refresh replicated weights. Refresh is tied to the
 next forward so a completed optimizer step is visible before compute reads the
@@ -586,7 +591,7 @@ final_callback:
 
 ---
 
-## `DataParallelBuffer.reduce_scatter_grad()` — Implementation Note
+## `DataParallelBuffer.reduce_grad()` — Implementation Note
 
 No `async_op` parameter is needed. The method is purely synchronous within the calling stream:
 
@@ -611,7 +616,7 @@ No `async_op` parameter is needed. The method is purely synchronous within the c
         local_grad_shard += grad_shard
 ```
 
-The caller (`FSDPModule.reduce_scatter_grad`) provides the stream context; `DataParallelBuffer`
+The caller (`FSDPModule.reduce_grad`) provides the stream context; `DataParallelBuffer`
 just does the collective. This clean separation means `DataParallelBuffer` requires no
 modifications for the overlap feature.
 
