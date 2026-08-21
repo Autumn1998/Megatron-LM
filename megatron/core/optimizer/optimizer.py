@@ -773,6 +773,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         return False
 
+    def _optimizer_step(self) -> None:
+        """Run the base optimizer step."""
+        self.optimizer.step()
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
@@ -783,7 +787,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            self.optimizer.step()
+            self._optimizer_step()
         if timers is not None:
             timers('optimizer-inner-step').stop()
 

@@ -2927,6 +2927,7 @@ def load_checkpoint(
             _get_mfsdp_v2_base_optimizer(optimizer),
             checkpoint_name,
             extra_state=state_dict,
+            skip_empty_optimizer_shards=True,
         )
         mfsdp_v2_dcp_loaded_in_place = True
 

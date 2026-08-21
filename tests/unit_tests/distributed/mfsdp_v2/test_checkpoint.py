@@ -2,6 +2,7 @@
 
 """DCP save/load roundtrip tests for the experimental Megatron-FSDP path."""
 
+import traceback
 from pathlib import Path
 
 import pytest
@@ -64,12 +65,30 @@ def _train_one_step(
     device: torch.device,
     *,
     param_dtype: torch.dtype,
+    skip_empty_optimizer_shards: bool,
 ) -> None:
     x = torch.randn(4, 8, device=device, dtype=param_dtype)
     target = torch.randn(4, 4, device=device, dtype=param_dtype)
     optimizer.zero_grad()
     ((model(x) - target) ** 2).mean().backward()
-    optimizer.step()
+    if not skip_empty_optimizer_shards:
+        optimizer.step()
+        return
+
+    full_param_groups = optimizer.param_groups
+    full_param_lists = [group["params"] for group in full_param_groups]
+    active_param_groups = []
+    try:
+        for group, full_params in zip(full_param_groups, full_param_lists):
+            group["params"] = [param for param in full_params if param.to_local().numel() > 0]
+            if group["params"]:
+                active_param_groups.append(group)
+        optimizer.param_groups = active_param_groups
+        optimizer.step()
+    finally:
+        optimizer.param_groups = full_param_groups
+        for group, full_params in zip(full_param_groups, full_param_lists):
+            group["params"] = full_params
 
 
 def _assert_tensors_identical(expected: torch.Tensor, actual: torch.Tensor, what: str) -> None:
@@ -165,8 +184,14 @@ def _assert_checkpoint_records_global_shapes(checkpoint_dir: Path, model: nn.Mod
 
 
 @pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize(
+    "skip_empty_optimizer_shards", [False, True], ids=["all-shards", "mcore-empty-filter"]
+)
 def test_checkpoint_roundtrip_flat_dp(
-    distributed_setup, tmp_path_dist_ckpt: Path, param_dtype: torch.dtype
+    distributed_setup,
+    tmp_path_dist_ckpt: Path,
+    param_dtype: torch.dtype,
+    skip_empty_optimizer_shards: bool,
 ) -> None:
     """Saving then loading a flat-DP sharded model+optimizer restores state bit-exactly.
 
@@ -182,10 +207,29 @@ def test_checkpoint_roundtrip_flat_dp(
 
     # Source: train one step so weights and optimizer state are non-trivial, then save.
     model, optimizer = _build_sharded(mesh, device, param_dtype=param_dtype, zero_init=False)
-    _train_one_step(model, optimizer, device, param_dtype=param_dtype)
+    _train_one_step(
+        model,
+        optimizer,
+        device,
+        param_dtype=param_dtype,
+        skip_empty_optimizer_shards=skip_empty_optimizer_shards,
+    )
     model_snapshot, optimizer_snapshot = _snapshot_state(model, optimizer)
 
-    with TempNamedDir(tmp_path_dist_ckpt / f"ckpt_{param_dtype}", sync=True) as checkpoint_dir:
+    if skip_empty_optimizer_shards:
+        local_missing_empty_state = any(
+            param.to_local().numel() == 0 and param not in optimizer.state
+            for group in optimizer.param_groups
+            for param in group["params"]
+        )
+        missing_flags = [None] * distributed_setup.world_size
+        torch.distributed.all_gather_object(missing_flags, local_missing_empty_state)
+        assert any(missing_flags), "The test did not create a filtered empty optimizer shard."
+
+    suffix = "filtered" if skip_empty_optimizer_shards else "complete"
+    with TempNamedDir(
+        tmp_path_dist_ckpt / f"ckpt_{param_dtype}_{suffix}", sync=True
+    ) as checkpoint_dir:
         extra_state = {"iteration": 7}
         save_checkpoint(model, optimizer, checkpoint_dir, extra_state=extra_state)
         _assert_checkpoint_records_global_shapes(checkpoint_dir, model)
@@ -193,14 +237,30 @@ def test_checkpoint_roundtrip_flat_dp(
         # Destination: zero-initialized, so a correct load is non-trivial.
         model, optimizer = _build_sharded(mesh, device, param_dtype=param_dtype, zero_init=True)
         loaded_extra_state = load_checkpoint(
-            model, optimizer, checkpoint_dir, extra_state={"iteration": 0}
+            model,
+            optimizer,
+            checkpoint_dir,
+            extra_state={"iteration": 0},
+            skip_empty_optimizer_shards=skip_empty_optimizer_shards,
         )
         assert loaded_extra_state == extra_state
 
-    local_nonempty = _assert_model_matches_snapshot(model, model_snapshot)
-    _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot)
+    local_nonempty = any(value.to_local().numel() > 0 for value in model_snapshot.values())
+    local_error = None
+    try:
+        _assert_model_matches_snapshot(model, model_snapshot)
+        _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot)
+    except Exception:
+        local_error = traceback.format_exc()
 
-    # At least one rank must have held non-empty local shards for the check to be meaningful.
-    nonempty_flags = [None] * distributed_setup.world_size
-    torch.distributed.all_gather_object(nonempty_flags, local_nonempty)
-    assert any(nonempty_flags), "All ranks had empty local shards."
+    results = [None] * distributed_setup.world_size
+    torch.distributed.all_gather_object(results, {"nonempty": local_nonempty, "error": local_error})
+    assert any(result["nonempty"] for result in results), "All ranks had empty local shards."
+    errors = [
+        f"rank {rank}:\n{result['error']}"
+        for rank, result in enumerate(results)
+        if result["error"] is not None
+    ]
+    if errors:
+        print("\n".join(errors), flush=True)
+    assert not errors, "\n".join(errors)

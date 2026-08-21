@@ -107,15 +107,28 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
 
     def zero_grad(self, set_to_none: bool = True) -> None:
-        """Clear optimizer-visible sharded grads and any grads filtered from local groups."""
+        """Clear optimizer-visible sharded gradients."""
         if not self.is_stub_optimizer:
             self.optimizer.zero_grad(set_to_none=set_to_none)
 
-        # Empty local DTensor shards are filtered out of optimizer param groups
-        # as a TE FusedAdam workaround. A rank with no local optimizer params
-        # can still have stale module grads to clear.
-        for model_chunk in self.model_chunks:
-            model_chunk.zero_grad(set_to_none=set_to_none)
+    def _optimizer_step(self) -> None:
+        """Step with only non-empty local DTensor shards visible to the optimizer."""
+        full_param_groups = self.optimizer.param_groups
+        full_param_lists = [group['params'] for group in full_param_groups]
+        active_param_groups = []
+        try:
+            for group, full_params in zip(full_param_groups, full_param_lists):
+                group['params'] = [
+                    parameter for parameter in full_params if parameter.to_local().numel() > 0
+                ]
+                if group['params']:
+                    active_param_groups.append(group)
+            self.optimizer.param_groups = active_param_groups
+            self.optimizer.step()
+        finally:
+            self.optimizer.param_groups = full_param_groups
+            for group, full_params in zip(full_param_groups, full_param_lists):
+                group['params'] = full_params
 
     def _copy_model_grads_to_main_grads(self) -> None:
         """No-op: MFSDP v2 reduces directly into optimizer-visible sharded grads."""
