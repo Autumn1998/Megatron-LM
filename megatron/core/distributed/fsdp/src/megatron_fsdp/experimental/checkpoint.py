@@ -72,7 +72,11 @@ def _init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
 
 
 def save_checkpoint(
-    model: torch.nn.Module, optimizer: torch.optim.Optimizer, checkpoint_dir: str | os.PathLike
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_dir: str | os.PathLike,
+    *,
+    extra_state: dict | None = None,
 ) -> None:
     """Save a ``fully_shard``-wrapped model and its optimizer as a DCP checkpoint.
 
@@ -80,14 +84,20 @@ def save_checkpoint(
         model: A module tree that has been sharded with :func:`fully_shard`.
         optimizer: Optimizer stepping the sharded parameters.
         checkpoint_dir: Destination directory for the DCP checkpoint.
+        extra_state: Optional non-model state to include in the same DCP checkpoint.
     """
     model_state_dict = get_model_state_dict(model)
     optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
     preprocess_state_dict_for_uneven_dtensor(model_state_dict)
     preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
-    dcp.save(
-        {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
-    )
+
+    state_dict = {"model": model_state_dict, "optimizer": optimizer_state_dict}
+    if extra_state:
+        overlap = state_dict.keys() & extra_state.keys()
+        if overlap:
+            raise ValueError(f"extra_state contains reserved keys: {sorted(overlap)}")
+        state_dict.update(extra_state)
+    dcp.save(state_dict, checkpoint_id=checkpoint_dir)
 
 
 def load_checkpoint(
@@ -96,7 +106,8 @@ def load_checkpoint(
     checkpoint_dir: str | os.PathLike,
     *,
     sync_model_weights: bool = True,
-) -> None:
+    extra_state: dict | None = None,
+) -> dict:
     """Load a DCP checkpoint into a ``fully_shard``-wrapped model and its optimizer.
 
     The model and optimizer must already be sharded with the same layout used at save time (the same
@@ -110,16 +121,26 @@ def load_checkpoint(
         optimizer: Optimizer whose state receives the load.
         checkpoint_dir: Source directory of the DCP checkpoint.
         sync_model_weights: Refresh compute weights from the loaded main weights afterwards.
+        extra_state: Optional non-model state template to load from the same DCP checkpoint.
+
+    Returns:
+        The loaded entries requested by ``extra_state``.
     """
     _init_optimizer_state(optimizer)
     model_state_dict = get_model_state_dict(model)
     optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
     preprocess_state_dict_for_uneven_dtensor(model_state_dict)
     preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
-    dcp.load(
-        {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
-    )
+
+    state_dict = {"model": model_state_dict, "optimizer": optimizer_state_dict}
+    if extra_state:
+        overlap = state_dict.keys() & extra_state.keys()
+        if overlap:
+            raise ValueError(f"extra_state contains reserved keys: {sorted(overlap)}")
+        state_dict.update(extra_state)
+    dcp.load(state_dict, checkpoint_id=checkpoint_dir)
     set_model_state_dict(model, model_state_dict)
     set_optimizer_state_dict(model, optimizer, optimizer_state_dict)
     if sync_model_weights:
         sync_model_weights_from_main_weights(model.parameters())
+    return {key: state_dict[key] for key in (extra_state or {})}

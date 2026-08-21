@@ -30,6 +30,7 @@ except ImportError:
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
+from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
@@ -42,13 +43,12 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
-from megatron.core.msc_utils import maybe_msc, MultiStorageClientFeature 
+from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
-from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
@@ -365,6 +365,69 @@ def checkpoint_exists(checkpoints_path):
         return False
     path = get_checkpoint_tracker_filename(checkpoints_path)
     return maybe_msc.os.path.isfile(path)
+
+
+def _is_mfsdp_v2_torch_dcp(args):
+    """Whether experimental Megatron-FSDP owns this native DCP checkpoint."""
+    return (
+        args.ckpt_format == 'torch_dcp'
+        and getattr(args, 'use_megatron_fsdp', False)
+        and getattr(args, 'megatron_fsdp_version', 1) == 2
+    )
+
+
+def _get_mfsdp_v2_base_optimizer(optimizer):
+    """Return the torch optimizer owned by MCore's MFSDP v2 optimizer wrapper."""
+    base_optimizer = getattr(optimizer, 'optimizer', None)
+    if not isinstance(base_optimizer, torch.optim.Optimizer):
+        raise TypeError(
+            'MFSDP v2 torch_dcp checkpointing requires one MCore optimizer wrapper around a '
+            'torch.optim.Optimizer.'
+        )
+    return base_optimizer
+
+
+def _save_mfsdp_v2_dcp_checkpoint(
+    checkpoint_dir,
+    model,
+    optimizer,
+    args,
+    iteration,
+    num_floating_point_operations_so_far,
+    opt_param_scheduler,
+    rng_state,
+    rerun_state,
+):
+    """Save MFSDP v2 tensors and MCore control state through the PR 6024 DCP API."""
+    if len(model) != 1:
+        raise ValueError('MFSDP v2 torch_dcp checkpointing requires exactly one model chunk.')
+    if args.no_save_optim:
+        raise ValueError('MFSDP v2 torch_dcp checkpointing requires optimizer state.')
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+        save_checkpoint as save_mfsdp_v2_checkpoint,
+    )
+
+    extra_state = {
+        'args': args,
+        'iteration': iteration,
+        'checkpoint_version': 3.0,
+        'num_floating_point_operations_so_far': num_floating_point_operations_so_far,
+    }
+    if opt_param_scheduler is not None:
+        extra_state['opt_param_scheduler'] = opt_param_scheduler.state_dict()
+    if not args.no_save_rng and rng_state:
+        extra_state['rng_state'] = rng_state
+    if rerun_state:
+        extra_state['rerun_state_machine'] = rerun_state
+
+    ensure_directory_exists(checkpoint_dir, check_parent=False)
+    save_mfsdp_v2_checkpoint(
+        model[0],
+        _get_mfsdp_v2_base_optimizer(optimizer),
+        checkpoint_dir,
+        extra_state=extra_state,
+    )
 
 
 def read_metadata(tracker_filename):
@@ -788,21 +851,46 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
-            state_dict = generate_state_dict(
-                args,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                rng_state,
-                iteration=iteration,
-                optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
-                model_sd_kwargs=dict(metadata=sharded_sd_metadata),
-                rerun_state=rerun_state,
+        mfsdp_v2_torch_dcp = _is_mfsdp_v2_torch_dcp(args)
+        if mfsdp_v2_torch_dcp:
+            if ckpt_type != CheckpointType.GLOBAL:
+                raise ValueError('MFSDP v2 torch_dcp supports only global checkpoints.')
+            with _otel_managed_span(
+                'checkpoint', 'megatron.checkpoint.save.io_write', is_goodput_span=True
+            ):
+                _save_mfsdp_v2_dcp_checkpoint(
+                    checkpoint_name,
+                    model,
+                    optimizer,
+                    args,
+                    iteration,
+                    num_floating_point_operations_so_far,
+                    opt_param_scheduler,
+                    rng_state,
+                    rerun_state,
+                )
+        else:
+            with _otel_managed_span(
+                'checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True
+            ):
+                state_dict = generate_state_dict(
+                    args,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    rng_state,
+                    iteration=iteration,
+                    optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                    model_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                    rerun_state=rerun_state,
+                )
+            state_dict['num_floating_point_operations_so_far'] = (
+                num_floating_point_operations_so_far
             )
 
-        state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
-        if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
+        if mfsdp_v2_torch_dcp:
+            pass
+        elif ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
                 ensure_directory_exists(checkpoint_name, check_parent=False)
@@ -1943,7 +2031,10 @@ def _get_checkpoint_format(checkpoint_name, args):
         ckpt_format = 'torch'
     elif is_torch_dcp:
         ckpt_format = 'torch_dcp'
-        if getattr(args, 'use_megatron_fsdp', False):
+        if (
+            getattr(args, 'use_megatron_fsdp', False)
+            and getattr(args, 'megatron_fsdp_version', 1) != 2
+        ):
             ckpt_format = 'fsdp_dtensor'
     else:
         raise NotImplementedError(f'unknown checkpoint format in {checkpoint_name}')
@@ -2071,7 +2162,10 @@ def _load_base_checkpoint(
     elif ckpt_format == 'torch_dcp':
         ckpt_type = CheckpointType.TORCH_DCP
 
-        if rank0:
+        if _is_mfsdp_v2_torch_dcp(args) and not rank0:
+            # The PR 6024 API loads model, optimizer, and MCore state together below.
+            state_dict = sharded_state_dict
+        elif rank0:
             # _load_base_checkpoint is called from load_args_from_checkpoint. torch.distributed is not initialized.
             # Load only metadata.
             state_dict = {'args': None, 'iteration': None}
@@ -2683,24 +2777,57 @@ def load_checkpoint(
                 if is_model or is_optim:
                     retarget_sharded_state_dict_to_gpt_checkpoint(sub_sd, gpt_compat_layer_maps)
     elif args.ckpt_format == 'torch_dcp':
-        model_sd = model[0].state_dict()
-        optimizer_sd = optimizer.state_dict(is_loading=True)
         if tp_group is None and pp_group is None:
             tp_group = mpu.get_tensor_model_parallel_group()
             pp_group = mpu.get_pipeline_model_parallel_group()
-        sharded_state_dict = {
-            'model': model_sd,
-            'optimizer': optimizer_sd,
-            'args': None,
-            'iteration': 1,
-            'rng_state': get_rng_state(
-                args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
-            ),
-            'checkpoint_version': None,
-            'opt_param_scheduler': opt_param_scheduler.state_dict(),
-            'num_floating_point_operations_so_far': 0,
-        }
-        load_kwargs['sharded_state_dict'] = sharded_state_dict
+        if _is_mfsdp_v2_torch_dcp(args):
+            state_dict_metadata = FileSystemReader(
+                get_load_checkpoint_path_by_args(args)
+            ).read_metadata().state_dict_metadata
+            sharded_state_dict = {
+                'args': None,
+                'iteration': 1,
+                'checkpoint_version': None,
+                'num_floating_point_operations_so_far': 0,
+            }
+            if not args.finetune:
+                if opt_param_scheduler is not None and 'opt_param_scheduler' in state_dict_metadata:
+                    sharded_state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
+                if not args.no_load_rng and 'rng_state' in state_dict_metadata:
+                    sharded_state_dict['rng_state'] = get_rng_state(
+                        args.ckpt_format,
+                        tp_group,
+                        pp_group,
+                        dp_cp_group=dp_cp_group,
+                        dp_group=dp_group,
+                    )
+                if 'rerun_state_machine' in state_dict_metadata:
+                    sharded_state_dict['rerun_state_machine'] = (
+                        get_rerun_state_machine().state_dict(
+                            data_iterator=None, ckpt_format=ckpt_format, force=True
+                        )
+                    )
+            load_kwargs['sharded_state_dict'] = sharded_state_dict
+        else:
+            model_sd = model[0].state_dict()
+            optimizer_sd = optimizer.state_dict(is_loading=True)
+            sharded_state_dict = {
+                'model': model_sd,
+                'optimizer': optimizer_sd,
+                'args': None,
+                'iteration': 1,
+                'rng_state': get_rng_state(
+                    args.ckpt_format,
+                    tp_group,
+                    pp_group,
+                    dp_cp_group=dp_cp_group,
+                    dp_group=dp_group,
+                ),
+                'checkpoint_version': None,
+                'opt_param_scheduler': opt_param_scheduler.state_dict(),
+                'num_floating_point_operations_so_far': 0,
+            }
+            load_kwargs['sharded_state_dict'] = sharded_state_dict
     elif args.ckpt_format == 'fsdp_dtensor':
         reader = FileSystemReader(get_load_checkpoint_path_by_args(args))
         try:
@@ -2784,6 +2911,24 @@ def load_checkpoint(
     if state_dict is None:
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
+
+    mfsdp_v2_dcp_loaded_in_place = False
+    if _is_mfsdp_v2_torch_dcp(args) and not skip_load_to_model_and_opt:
+        if len(model) != 1:
+            raise ValueError('MFSDP v2 torch_dcp checkpointing requires exactly one model chunk.')
+        if args.no_load_optim:
+            raise ValueError('MFSDP v2 torch_dcp checkpointing requires optimizer state.')
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+            load_checkpoint as load_mfsdp_v2_checkpoint,
+        )
+
+        state_dict = load_mfsdp_v2_checkpoint(
+            model[0],
+            _get_mfsdp_v2_base_optimizer(optimizer),
+            checkpoint_name,
+            extra_state=state_dict,
+        )
+        mfsdp_v2_dcp_loaded_in_place = True
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
@@ -2884,7 +3029,8 @@ def load_checkpoint(
     )
 
     # Model.
-    if not skip_load_to_model_and_opt and not gpt_fsdp_model_loaded_in_place:
+    model_loaded_in_place = gpt_fsdp_model_loaded_in_place or mfsdp_v2_dcp_loaded_in_place
+    if not skip_load_to_model_and_opt and not model_loaded_in_place:
         if len(ddp_model) == 1:
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
         else:
@@ -2914,7 +3060,8 @@ def load_checkpoint(
                 )
                 optimizer.load_state_dict_from_file(optim_checkpoint_name)
             elif (
-                not skip_load_to_model_and_opt
+                not mfsdp_v2_dcp_loaded_in_place
+                and not skip_load_to_model_and_opt
                 and optimizer is not None
                 and not optimizer.is_stub_optimizer
             ):

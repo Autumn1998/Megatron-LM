@@ -56,10 +56,13 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         Flat,
+        Partial,
         Placements,
+        Replicate,
         fully_shard,
         fully_shard_context,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -67,6 +70,19 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+
+def _placements_from_sharding_strategy(strategy: str) -> Placements:
+    """Translate an MFSDP sharding strategy into parameter, gradient, and optimizer placements."""
+    if strategy == "no_shard":
+        return Placements([0], [Replicate()], [Partial(dist.ReduceOp.AVG)], [Replicate()])
+    if strategy == "optim":
+        return Placements([0], [Replicate()], [Partial(dist.ReduceOp.AVG)], [Flat()])
+    if strategy == "optim_grads":
+        return Placements([0], [Replicate()], [Flat()], [Flat()])
+    if strategy == "optim_grads_params":
+        return Placements([0], [Flat()], [Flat()], [Flat()])
+    raise ValueError(f"Unsupported MFSDP sharding strategy: {strategy}")
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
@@ -571,13 +587,32 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             expert_dp_mesh = DeviceMesh.from_group(
                 pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
             )
-        placements = Placements(
-            dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+        dense_placements = _placements_from_sharding_strategy(
+            ddp_config.data_parallel_sharding_strategy
+        )
+        expert_placements = _placements_from_sharding_strategy(
+            ddp_config.expert_data_parallel_sharding_strategy
+            or ddp_config.data_parallel_sharding_strategy
         )
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
+        reset_parameter_fns = []
+        if config.init_model_with_meta_device:
+            for submodule in module.modules():
+                if not any(parameter.is_meta for parameter in submodule.parameters(recurse=False)):
+                    continue
+                reset_parameters = getattr(submodule, "reset_parameters", None)
+                if reset_parameters is None:
+                    reset_parameters = getattr(submodule, "_reset_parameters", None)
+                if reset_parameters is None:
+                    raise ValueError(
+                        f"Meta parameter module {type(submodule).__qualname__} does not have a "
+                        "reset_parameters or _reset_parameters method."
+                    )
+                reset_parameter_fns.append(reset_parameters)
+
         with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
@@ -588,7 +623,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
-                            placements=placements,
+                            placements=expert_placements,
                             mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
                         )
@@ -601,12 +636,28 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     fully_shard(
                         submodule,
                         mesh=dp_mesh,
-                        placements=placements,
+                        placements=dense_placements,
                         mixed_precision_policy=self.mp_policy,
                     )
             fully_shard(
-                module, mesh=dp_mesh, placements=placements, mixed_precision_policy=self.mp_policy
+                module,
+                mesh=dp_mesh,
+                placements=dense_placements,
+                mixed_precision_policy=self.mp_policy,
             )
+        if reset_parameter_fns:
+            parameter_groups = tuple(
+                parameter_group
+                for submodule in module.modules()
+                if isinstance(submodule, FsdpModule)
+                for parameter_group in submodule.parameter_groups
+            )
+            for reset_parameters in reset_parameter_fns:
+                reset_parameters()
+            for parameter_group in parameter_groups:
+                parameter_group.reshard_parameters()
+                parameter_group.sync_model_weight_from_main_weight()
+
         super().__init__(config=config, module=module)
 
     @staticmethod

@@ -186,12 +186,16 @@ def test_checkpoint_roundtrip_flat_dp(
     model_snapshot, optimizer_snapshot = _snapshot_state(model, optimizer)
 
     with TempNamedDir(tmp_path_dist_ckpt / f"ckpt_{param_dtype}", sync=True) as checkpoint_dir:
-        save_checkpoint(model, optimizer, checkpoint_dir)
+        extra_state = {"iteration": 7}
+        save_checkpoint(model, optimizer, checkpoint_dir, extra_state=extra_state)
         _assert_checkpoint_records_global_shapes(checkpoint_dir, model)
 
         # Destination: zero-initialized, so a correct load is non-trivial.
         model, optimizer = _build_sharded(mesh, device, param_dtype=param_dtype, zero_init=True)
-        load_checkpoint(model, optimizer, checkpoint_dir)
+        loaded_extra_state = load_checkpoint(
+            model, optimizer, checkpoint_dir, extra_state={"iteration": 0}
+        )
+        assert loaded_extra_state == extra_state
 
     local_nonempty = _assert_model_matches_snapshot(model, model_snapshot)
     _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot)
