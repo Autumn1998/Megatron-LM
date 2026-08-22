@@ -72,12 +72,14 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
-def _placements_from_sharding_strategy(strategy: str) -> Placements:
+def _placements_from_sharding_strategy(
+    strategy: str, gradient_reduce_op: dist.ReduceOp.RedOpType = dist.ReduceOp.AVG
+) -> Placements:
     """Translate an MFSDP sharding strategy into parameter, gradient, and optimizer placements."""
     if strategy == "no_shard":
-        return Placements([0], [Replicate()], [Partial(dist.ReduceOp.AVG)], [Replicate()])
+        return Placements([0], [Replicate()], [Partial(gradient_reduce_op)], [Replicate()])
     if strategy == "optim":
-        return Placements([0], [Replicate()], [Partial(dist.ReduceOp.AVG)], [Flat()])
+        return Placements([0], [Replicate()], [Partial(gradient_reduce_op)], [Flat()])
     if strategy == "optim_grads":
         return Placements([0], [Replicate()], [Flat()], [Flat()])
     if strategy == "optim_grads_params":
@@ -587,12 +589,22 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             expert_dp_mesh = DeviceMesh.from_group(
                 pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
             )
+        gradient_reduce_op = (
+            dist.ReduceOp.AVG if ddp_config.average_in_collective else dist.ReduceOp.SUM
+        )
         dense_placements = _placements_from_sharding_strategy(
-            ddp_config.data_parallel_sharding_strategy
+            ddp_config.data_parallel_sharding_strategy, gradient_reduce_op
         )
         expert_placements = _placements_from_sharding_strategy(
             ddp_config.expert_data_parallel_sharding_strategy
-            or ddp_config.data_parallel_sharding_strategy
+            or ddp_config.data_parallel_sharding_strategy,
+            gradient_reduce_op,
+        )
+        dense_grad_divisor = 1 if ddp_config.average_in_collective else dp_group.size()
+        expert_grad_divisor = (
+            config.expert_model_parallel_size
+            if ddp_config.average_in_collective
+            else dp_group.size()
         )
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
@@ -625,7 +637,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
                             mixed_precision_policy=self.mp_policy,
-                            grad_divisor=config.expert_model_parallel_size,
+                            grad_divisor=expert_grad_divisor,
+                            gradient_reduce_op=gradient_reduce_op,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -638,12 +651,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         mesh=dp_mesh,
                         placements=dense_placements,
                         mixed_precision_policy=self.mp_policy,
+                        grad_divisor=dense_grad_divisor,
+                        gradient_reduce_op=gradient_reduce_op,
                     )
             fully_shard(
                 module,
                 mesh=dp_mesh,
                 placements=dense_placements,
                 mixed_precision_policy=self.mp_policy,
+                grad_divisor=dense_grad_divisor,
+                gradient_reduce_op=gradient_reduce_op,
             )
         if reset_parameter_fns:
             parameter_groups = tuple(

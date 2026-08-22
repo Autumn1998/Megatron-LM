@@ -264,3 +264,64 @@ def test_checkpoint_roundtrip_flat_dp(
     if errors:
         print("\n".join(errors), flush=True)
     assert not errors, "\n".join(errors)
+
+
+def test_checkpoint_roundtrip_disjoint_submeshes(
+    distributed_setup, tmp_path_dist_ckpt: Path
+) -> None:
+    """Independent meshes may own different tensors under the same model FQNs."""
+    world_size = distributed_setup.world_size
+    if world_size < 4 or world_size % 2:
+        pytest.skip("requires an even world size of at least four")
+
+    init_device_mesh(distributed_setup.device.type, (world_size,))
+    rank = distributed_setup.rank
+    group_id = rank % 2
+    rank_groups = [list(range(offset, world_size, 2)) for offset in range(2)]
+    process_groups = [torch.distributed.new_group(ranks=ranks) for ranks in rank_groups]
+    mesh = DeviceMesh.from_group(
+        process_groups[group_id],
+        device_type=distributed_setup.device.type,
+        mesh=rank_groups[group_id],
+        mesh_dim_names=("dp",),
+    )
+
+    torch.manual_seed(9000 + group_id)
+    torch.cuda.manual_seed_all(9000 + group_id)
+    model, optimizer = _build_sharded(
+        mesh, distributed_setup.device, param_dtype=torch.bfloat16, zero_init=False
+    )
+    _train_one_step(
+        model,
+        optimizer,
+        distributed_setup.device,
+        param_dtype=torch.bfloat16,
+        skip_empty_optimizer_shards=True,
+    )
+    model_snapshot, optimizer_snapshot = _snapshot_state(model, optimizer)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "ckpt_disjoint_submeshes", sync=True) as checkpoint_dir:
+        save_checkpoint(model, optimizer, checkpoint_dir, extra_state={"iteration": 7})
+        model, optimizer = _build_sharded(
+            mesh, distributed_setup.device, param_dtype=torch.bfloat16, zero_init=True
+        )
+        loaded_extra_state = load_checkpoint(
+            model,
+            optimizer,
+            checkpoint_dir,
+            extra_state={"iteration": 0},
+            skip_empty_optimizer_shards=True,
+        )
+        assert loaded_extra_state == {"iteration": 7}
+
+    local_error = None
+    try:
+        _assert_model_matches_snapshot(model, model_snapshot)
+        _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot)
+    except Exception:
+        local_error = traceback.format_exc()
+
+    errors = [None] * world_size
+    torch.distributed.all_gather_object(errors, local_error)
+    errors = [f"rank {rank}:\n{error}" for rank, error in enumerate(errors) if error is not None]
+    assert not errors, "\n".join(errors)

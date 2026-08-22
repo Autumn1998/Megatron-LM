@@ -376,6 +376,17 @@ def _is_mfsdp_v2_torch_dcp(args):
     )
 
 
+def _dcp_metadata_has_prefix(state_dict_metadata, prefix):
+    """Whether DCP metadata contains a key or a flattened child of that key."""
+    return any(key == prefix or key.startswith(f'{prefix}.') for key in state_dict_metadata)
+
+
+def _mfsdp_v2_dcp_rank_key():
+    """Stable key for rank-local DCP control state."""
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    return f'rank_{rank}'
+
+
 def _get_mfsdp_v2_base_optimizer(optimizer):
     """Return the torch optimizer owned by MCore's MFSDP v2 optimizer wrapper."""
     base_optimizer = getattr(optimizer, 'optimizer', None)
@@ -416,17 +427,15 @@ def _save_mfsdp_v2_dcp_checkpoint(
     }
     if opt_param_scheduler is not None:
         extra_state['opt_param_scheduler'] = opt_param_scheduler.state_dict()
+    rank_key = _mfsdp_v2_dcp_rank_key()
     if not args.no_save_rng and rng_state:
-        extra_state['rng_state'] = rng_state
+        extra_state['rng_state'] = {rank_key: rng_state}
     if rerun_state:
-        extra_state['rerun_state_machine'] = rerun_state
+        extra_state['rerun_state_machine'] = {rank_key: rerun_state}
 
     ensure_directory_exists(checkpoint_dir, check_parent=False)
     save_mfsdp_v2_checkpoint(
-        model[0],
-        _get_mfsdp_v2_base_optimizer(optimizer),
-        checkpoint_dir,
-        extra_state=extra_state,
+        model[0], _get_mfsdp_v2_base_optimizer(optimizer), checkpoint_dir, extra_state=extra_state
     )
 
 
@@ -962,7 +971,9 @@ def save_checkpoint(
             logger.debug(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
-            with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.io_write', is_goodput_span=True):
+            with _otel_managed_span(
+                'checkpoint', 'megatron.checkpoint.save.io_write', is_goodput_span=True
+            ):
                 async_save_request = dist_checkpointing.save(
                     state_dict,
                     checkpoint_name,
@@ -1096,8 +1107,7 @@ def save_checkpoint(
 
     # And update the latest iteration
     if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized()
-        or torch.distributed.get_rank() == 0
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     ):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
@@ -1228,9 +1238,7 @@ def save_checkpoint(
             iter_finalize_fn()
 
     # Additional callback for one_logger (last rank)
-    if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized() or is_last_rank()
-    ):
+    if not skip_weight_ckpt and (not torch.distributed.is_initialized() or is_last_rank()):
 
         def onelogger_finalize_fn():
             on_save_checkpoint_success(productive_metrics, args.async_save)
@@ -1242,9 +1250,7 @@ def save_checkpoint(
             onelogger_finalize_fn()
 
     # Additional callback for wandb (last rank)
-    if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized() or is_last_rank()
-    ):
+    if not skip_weight_ckpt and (not torch.distributed.is_initialized() or is_last_rank()):
 
         def wandb_finalize_fn():
             wandb_utils.on_save_checkpoint_success(
@@ -1278,16 +1284,16 @@ def save_checkpoint(
             # never skips or replays a window. Written by a single rank -- the last rank, which
             # lives on the last pipeline stage where the logits saver is attached (get_logits_saver
             # is None on earlier stages, including global rank 0 when PP > 1).
-            if skip_weight_ckpt and (
-                not torch.distributed.is_initialized() or is_last_rank()
-            ):
+            if skip_weight_ckpt and (not torch.distributed.is_initialized() or is_last_rank()):
 
                 def progress_finalize_fn():
                     tracker_filename = get_checkpoint_tracker_filename(args.save)
                     with maybe_msc.open(tracker_filename, 'w') as f:
                         f.write(str(iteration))
-                    print_rank_last(f"  recorded logits-dump progress: iteration "
-                                    f"{iteration} to {tracker_filename}")
+                    print_rank_last(
+                        f"  recorded logits-dump progress: iteration "
+                        f"{iteration} to {tracker_filename}"
+                    )
 
                 logits_finalize_fns.append(progress_finalize_fn)
             async_request_cls = get_async_strategy(args.async_strategy)[1]['AsyncRequest']
@@ -1319,9 +1325,7 @@ def save_checkpoint(
 
 
 def save_tokenizer_assets(
-    tokenizer: MegatronTokenizer,
-    config: TokenizerConfig,
-    checkpoint_path: str,
+    tokenizer: MegatronTokenizer, config: TokenizerConfig, checkpoint_path: str
 ) -> None:
     """Save tokenizer files to the checkpoint directory.
 
@@ -1354,8 +1358,8 @@ def save_tokenizer_assets(
 
     try:
         # Check if MultiStorageClient is enabled
-        if MultiStorageClientFeature .is_enabled():
-            msc = MultiStorageClientFeature .import_package()
+        if MultiStorageClientFeature.is_enabled():
+            msc = MultiStorageClientFeature.import_package()
             checkpoint_path_obj = msc.Path(checkpoint_path)
             tokenizer_dir = checkpoint_path_obj / "tokenizer"
             tokenizer_dir.mkdir(parents=True, exist_ok=True)
@@ -1375,10 +1379,14 @@ def save_tokenizer_assets(
                 with tempfile.TemporaryDirectory() as tmp_dir:
                     if hasattr(tokenizer, "save_pretrained"):
                         tokenizer.save_pretrained(tmp_dir)
-                    elif hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "save_pretrained"):
+                    elif hasattr(tokenizer, "_tokenizer") and hasattr(
+                        tokenizer._tokenizer, "save_pretrained"
+                    ):
                         tokenizer._tokenizer.save_pretrained(tmp_dir)
                     else:
-                        logger.debug(f"{tokenizer_type} does not support save_pretrained(), skipping tokenizer save")
+                        logger.debug(
+                            f"{tokenizer_type} does not support save_pretrained(), skipping tokenizer save"
+                        )
                         return
 
                     logger.debug(f"Saving {tokenizer_type} files to {tokenizer_dir}")
@@ -1393,7 +1401,9 @@ def save_tokenizer_assets(
                 logger.debug(f"Saving {tokenizer_type} files to {tokenizer_dir}")
                 if hasattr(tokenizer, "save_pretrained"):
                     tokenizer.save_pretrained(tokenizer_dir)
-                elif hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "save_pretrained"):
+                elif hasattr(tokenizer, "_tokenizer") and hasattr(
+                    tokenizer._tokenizer, "save_pretrained"
+                ):
                     tokenizer._tokenizer.save_pretrained(tokenizer_dir)
             return
 
@@ -1413,7 +1423,11 @@ def save_tokenizer_assets(
                 resolved_path = resolve_path(config.merge_file)
                 files_to_copy.append(("merge_file", resolved_path, "merges.txt"))
 
-        elif tokenizer_type in ("SentencePieceTokenizer", "GPTSentencePieceTokenizer", "Llama2Tokenizer"):
+        elif tokenizer_type in (
+            "SentencePieceTokenizer",
+            "GPTSentencePieceTokenizer",
+            "Llama2Tokenizer",
+        ):
             if config.tokenizer_model:
                 resolved_path = resolve_path(config.tokenizer_model)
                 files_to_copy.append(("tokenizer_model", resolved_path, "tokenizer.model"))
@@ -1695,9 +1709,7 @@ def generate_state_dict(
     # Applied here so the SAME decision is used for both the save state dict and
     # the load *request* (`generate_state_dict` is the shared chokepoint), which
     # keeps the two symmetric and backward compatible.
-    if args.ckpt_format == "torch_dist" and getattr(
-        args, "ckpt_drop_redundant_extra_state", False
-    ):
+    if args.ckpt_format == "torch_dist" and getattr(args, "ckpt_drop_redundant_extra_state", False):
         _localize_redundant_extra_states(state_dict)
 
     return state_dict
@@ -1999,9 +2011,7 @@ def _load_global_dist_base_checkpoint(
             load_strategy,
             process_group,
             exchange_algo=args.ckpt_fully_parallel_load_exchange_algo,
-            per_rank_object_load=getattr(
-                args, 'ckpt_fully_parallel_load_per_rank_objects', False
-            ),
+            per_rank_object_load=getattr(args, 'ckpt_fully_parallel_load_per_rank_objects', False),
             pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
             pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
         )
@@ -2550,7 +2560,9 @@ def load_checkpoint(
     state_dict = None
     release = False
     if args.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
-        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load.io_read', is_goodput_span=True):
+        with _otel_managed_span(
+            'load_checkpoint', 'megatron.checkpoint.load.io_read', is_goodput_span=True
+        ):
             state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
                 load_dir, args, rank0=True, checkpointing_context=checkpointing_context
             )
@@ -2781,9 +2793,12 @@ def load_checkpoint(
             tp_group = mpu.get_tensor_model_parallel_group()
             pp_group = mpu.get_pipeline_model_parallel_group()
         if _is_mfsdp_v2_torch_dcp(args):
-            state_dict_metadata = FileSystemReader(
-                get_load_checkpoint_path_by_args(args)
-            ).read_metadata().state_dict_metadata
+            state_dict_metadata = (
+                FileSystemReader(get_load_checkpoint_path_by_args(args))
+                .read_metadata()
+                .state_dict_metadata
+            )
+            rank_key = _mfsdp_v2_dcp_rank_key()
             sharded_state_dict = {
                 'args': None,
                 'iteration': 1,
@@ -2791,22 +2806,34 @@ def load_checkpoint(
                 'num_floating_point_operations_so_far': 0,
             }
             if not args.finetune:
-                if opt_param_scheduler is not None and 'opt_param_scheduler' in state_dict_metadata:
+                if opt_param_scheduler is not None and _dcp_metadata_has_prefix(
+                    state_dict_metadata, 'opt_param_scheduler'
+                ):
                     sharded_state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
-                if not args.no_load_rng and 'rng_state' in state_dict_metadata:
-                    sharded_state_dict['rng_state'] = get_rng_state(
+                if not args.no_load_rng and _dcp_metadata_has_prefix(
+                    state_dict_metadata, 'rng_state'
+                ):
+                    rng_state_template = get_rng_state(
                         args.ckpt_format,
                         tp_group,
                         pp_group,
                         dp_cp_group=dp_cp_group,
                         dp_group=dp_group,
                     )
-                if 'rerun_state_machine' in state_dict_metadata:
-                    sharded_state_dict['rerun_state_machine'] = (
-                        get_rerun_state_machine().state_dict(
-                            data_iterator=None, ckpt_format=ckpt_format, force=True
-                        )
+                    if _dcp_metadata_has_prefix(state_dict_metadata, f'rng_state.{rank_key}'):
+                        sharded_state_dict['rng_state'] = {rank_key: rng_state_template}
+                    else:
+                        sharded_state_dict['rng_state'] = rng_state_template
+                if _dcp_metadata_has_prefix(state_dict_metadata, 'rerun_state_machine'):
+                    rerun_state_template = get_rerun_state_machine().state_dict(
+                        data_iterator=None, ckpt_format=ckpt_format, force=True
                     )
+                    if _dcp_metadata_has_prefix(
+                        state_dict_metadata, f'rerun_state_machine.{rank_key}'
+                    ):
+                        sharded_state_dict['rerun_state_machine'] = {rank_key: rerun_state_template}
+                    else:
+                        sharded_state_dict['rerun_state_machine'] = rerun_state_template
             load_kwargs['sharded_state_dict'] = sharded_state_dict
         else:
             model_sd = model[0].state_dict()
@@ -2817,11 +2844,7 @@ def load_checkpoint(
                 'args': None,
                 'iteration': 1,
                 'rng_state': get_rng_state(
-                    args.ckpt_format,
-                    tp_group,
-                    pp_group,
-                    dp_cp_group=dp_cp_group,
-                    dp_group=dp_group,
+                    args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
                 ),
                 'checkpoint_version': None,
                 'opt_param_scheduler': opt_param_scheduler.state_dict(),
@@ -2929,6 +2952,12 @@ def load_checkpoint(
             extra_state=state_dict,
             skip_empty_optimizer_shards=True,
         )
+        rank_key = _mfsdp_v2_dcp_rank_key()
+        for state_key in ('rng_state', 'rerun_state_machine'):
+            rank_values = state_dict.get(state_key)
+            if isinstance(rank_values, dict) and rank_key in rank_values:
+                state_dict[state_key] = rank_values[rank_key]
+
         mfsdp_v2_dcp_loaded_in_place = True
 
     # Set checkpoint version.
@@ -2994,8 +3023,10 @@ def load_checkpoint(
         args.consumed_train_samples = iteration * args.global_batch_size
         args.skipped_train_samples = 0
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
-        print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
-                     f'(consumed_train_samples {args.consumed_train_samples})')
+        print_rank_0(
+            f'--override-ckpt-iteration: start at iteration {iteration} '
+            f'(consumed_train_samples {args.consumed_train_samples})'
+        )
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""

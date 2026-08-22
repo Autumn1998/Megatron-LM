@@ -85,6 +85,8 @@ class FsdpParameterGroup:
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
+    gradient_reduce_op: dist.ReduceOp.RedOpType
+    grad_comm_dtype: torch.dtype
 
     def __init__(
         self,
@@ -96,6 +98,7 @@ class FsdpParameterGroup:
         allgather_stream: torch.cuda.Stream,
         reduce_scatter_stream: torch.cuda.Stream,
         grad_divisor: int = 1,
+        gradient_reduce_op: dist.ReduceOp.RedOpType = dist.ReduceOp.AVG,
         use_symmetric_memory: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
@@ -110,8 +113,9 @@ class FsdpParameterGroup:
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
             use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
-            grad_divisor: Additional divisor applied on top of the mesh-size
-                averaging. See ``fully_shard``.
+            grad_divisor: Divisor applied locally before gradient reduction. See
+                ``fully_shard``.
+            gradient_reduce_op: Operation used to reduce partial gradients.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
@@ -135,6 +139,7 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
+        self.gradient_reduce_op = gradient_reduce_op
         first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
@@ -193,6 +198,7 @@ class FsdpParameterGroup:
         self.main_grad = None
         if self.requires_grad:
             grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
+            self.grad_comm_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
             # Keep main_grad persistent for the initial implementation. For micro-batch
             # size 1, this allocation could be delayed until post_backward and then
             # eagerly deallocated right after optimizer.step(), avoiding main_grad
@@ -335,9 +341,9 @@ class FsdpParameterGroup:
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
-                placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
+                placements=[Partial(self.gradient_reduce_op)] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
-                dtype=grads[0].dtype,
+                dtype=self.grad_comm_dtype,
                 device=grads[0].device,
             )
 
@@ -380,6 +386,11 @@ class FsdpParameterGroup:
         # leaves sharded grads installed, so this backward accumulates into main_grad.
         has_sharded_grads = self._has_sharded_grads()
 
+        # Match MCore DDP by applying local gradient scaling before the
+        # data-parallel collective.
+        if self.grad_divisor != 1:
+            partial_grad.local_buffer.div_(self.grad_divisor)
+
         # A non-accumulation main_grad means the previous step finalized it; this
         # only happens on the first microbatch. Restore it to the DP-outer-Partial
         # accumulation placement. HSDP's finalize keeps the buffer size (Replicate
@@ -419,11 +430,6 @@ class FsdpParameterGroup:
             reduced_grad = self.main_grad
         else:
             reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-
-        # Scale this backward's contribution before accumulating it so repeated
-        # backwards do not repeatedly scale the running total.
-        if self.grad_divisor != 1:
-            reduced_grad.local_buffer.div_(self.grad_divisor)
 
         if reduced_grad is not self.main_grad:
             if has_sharded_grads:

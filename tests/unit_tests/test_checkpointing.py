@@ -22,6 +22,7 @@ from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
+    _dcp_metadata_has_prefix,
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
     load_args_from_checkpoint,
@@ -33,6 +34,18 @@ from megatron.training.checkpointing import (
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize(
+    ("metadata", "prefix", "expected"),
+    [
+        ({"iteration": object()}, "iteration", True),
+        ({"opt_param_scheduler.max_lr": object()}, "opt_param_scheduler", True),
+        ({"optimizer.state": object()}, "opt_param_scheduler", False),
+    ],
+)
+def test_dcp_metadata_has_prefix(metadata, prefix, expected):
+    assert _dcp_metadata_has_prefix(metadata, prefix) is expected
 
 
 class MockModel(MegatronModule):

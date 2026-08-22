@@ -174,6 +174,7 @@ class FsdpModule:
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
+        gradient_reduce_op: torch.distributed.ReduceOp.RedOpType = (torch.distributed.ReduceOp.AVG),
         use_symmetric_memory: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
@@ -198,6 +199,7 @@ class FsdpModule:
                 allgather_stream=context.allgather_stream,
                 reduce_scatter_stream=context.reduce_scatter_stream,
                 grad_divisor=grad_divisor,
+                gradient_reduce_op=gradient_reduce_op,
                 use_symmetric_memory=use_symmetric_memory,
             )
             for group_parameters in _group_parameters(owned_parameters)

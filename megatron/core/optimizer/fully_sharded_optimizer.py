@@ -5,6 +5,7 @@
 from typing import Callable, List, Optional
 
 import torch
+from torch.distributed.tensor import DTensor, Replicate
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -110,6 +111,38 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Clear optimizer-visible sharded gradients."""
         if not self.is_stub_optimizer:
             self.optimizer.zero_grad(set_to_none=set_to_none)
+
+    def _filter_grads_for_norm(
+        self,
+        params: List[torch.nn.Parameter],
+        param_filter: Optional[Callable[[torch.nn.Parameter], bool]] = None,
+    ) -> List[torch.Tensor]:
+        """Return each MFSDP gradient shard exactly once for global norm reduction."""
+        local_grads = []
+        for grad in super()._filter_grads_for_norm(params, param_filter):
+            if isinstance(grad, DTensor):
+                coordinate = grad.device_mesh.get_coordinate()
+                if coordinate is None or any(
+                    isinstance(placement, Replicate) and coordinate[axis] != 0
+                    for axis, placement in enumerate(grad.placements)
+                ):
+                    continue
+                grad = grad.to_local()
+            local_grads.append(grad)
+        return local_grads
+
+    @torch.no_grad()
+    def count_zeros(self) -> float:
+        """Count zeros once across mixed MFSDP dense and expert meshes."""
+        total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
+        for grad in self._filter_grads_for_norm(self.get_parameters()):
+            total_num_zeros += grad.numel() - torch.count_nonzero(grad)
+        torch.distributed.all_reduce(
+            total_num_zeros,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.get_grad_stats_parallel_group(),
+        )
+        return float(total_num_zeros.item())
 
     def _optimizer_step(self) -> None:
         """Step with only non-empty local DTensor shards visible to the optimizer."""

@@ -78,6 +78,7 @@ class TestMcoreAdapterDense:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_main_grads_dtype=torch.float32,
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
@@ -103,6 +104,11 @@ class TestMcoreAdapterDense:
         }
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
+        for fsdp_module in (wrapped.module, wrapped.module[0]):
+            for parameter_group in fsdp_module.parameter_groups:
+                assert parameter_group.gradient_reduce_op == torch.distributed.ReduceOp.SUM
+                assert parameter_group.grad_divisor == self.pg_collection.dp_cp.size()
+                assert parameter_group.grad_comm_dtype == torch.float32
 
     def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
         config = TransformerConfig(
@@ -361,7 +367,11 @@ class TestMcoreAdapterExpertParallel:
         assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
 
         optimizer_config = OptimizerConfig(
-            lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=0.0
+            lr=1.0e-3,
+            weight_decay=0.0,
+            use_distributed_optimizer=False,
+            clip_grad=1.0,
+            log_num_zeros_in_grad=True,
         )
         reference_optimizer = get_megatron_optimizer(
             optimizer_config, [reference_model], use_gloo_process_groups=False
@@ -391,8 +401,10 @@ class TestMcoreAdapterExpertParallel:
                 targets,
             )
             reference_loss.backward()
-            reference_success, _, _ = reference_optimizer.step()
+            reference_success, reference_grad_norm, reference_num_zeros = reference_optimizer.step()
             assert reference_success
+            assert reference_grad_norm is not None and reference_grad_norm > 0.0
+            assert reference_num_zeros is not None and reference_num_zeros >= 0.0
             reference_losses.append(reference_loss.detach())
 
         losses = []
@@ -407,8 +419,10 @@ class TestMcoreAdapterExpertParallel:
                 targets[input_slice],
             )
             loss.backward()
-            success, _, _ = optimizer.step()
+            success, grad_norm, num_zeros = optimizer.step()
             assert success
+            assert grad_norm is not None and grad_norm > 0.0
+            assert num_zeros is not None and num_zeros >= 0.0
             loss = loss.detach()
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
             losses.append(loss)

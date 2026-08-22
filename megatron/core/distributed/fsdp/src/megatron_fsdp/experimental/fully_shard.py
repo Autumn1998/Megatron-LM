@@ -80,6 +80,7 @@ def fully_shard(
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     grad_divisor: int = 1,
+    gradient_reduce_op: torch.distributed.ReduceOp.RedOpType = torch.distributed.ReduceOp.AVG,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -92,9 +93,9 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
-        grad_divisor: Additional divisor applied to the reduced gradient, on top of the
-            averaging the mesh already performs. Defaults to 1, which is correct whenever
-            each mesh rank contributes exactly one term to the gradient.
+        grad_divisor: Divisor applied to each local gradient before reduction. Defaults
+            to 1, which is correct with an AVG reduction whenever each mesh rank
+            contributes exactly one term to the gradient.
 
             Expert parallelism is the motivating case. A rank's experts process tokens
             routed to them from every rank in the expert-parallel group, and the backward
@@ -103,6 +104,8 @@ def fully_shard(
             the expert-data-parallel mesh alone therefore divides by too little, and
             ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
             their own rank's tokens and need no divisor.
+        gradient_reduce_op: Reduction applied to partial gradients. Callers using SUM
+            should set ``grad_divisor`` to the full data-parallel divisor.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -129,6 +132,7 @@ def fully_shard(
             placements=placements,
             mixed_precision_policy=mixed_precision_policy,
             grad_divisor=grad_divisor,
+            gradient_reduce_op=gradient_reduce_op,
             use_symmetric_memory=context.use_symmetric_memory,
         )
     except Exception:

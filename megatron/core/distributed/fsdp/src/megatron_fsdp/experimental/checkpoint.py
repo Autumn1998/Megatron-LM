@@ -50,6 +50,67 @@ from .parameter_group import sync_model_weights_from_main_weights
 __all__ = ["save_checkpoint", "load_checkpoint"]
 
 
+def _mesh_namespace(dtensor: DTensor) -> str | None:
+    """Return a stable namespace for a DTensor living on a world sub-mesh."""
+    mesh_ranks = tuple(int(rank) for rank in dtensor.device_mesh.mesh.reshape(-1).tolist())
+    if torch.distributed.is_initialized():
+        world_ranks = tuple(range(torch.distributed.get_world_size()))
+        if mesh_ranks == world_ranks:
+            return None
+    elif mesh_ranks == (0,):
+        return None
+    return "__mfsdp_mesh_" + "_".join(str(rank) for rank in mesh_ranks) + "__"
+
+
+def _namespace_submesh_state_dicts(
+    model_state_dict: dict, optimizer_state_dict: dict
+) -> tuple[dict, dict, dict[str, str]]:
+    """Disambiguate identical FQNs that belong to independent device meshes.
+
+    Expert-parallel ranks own different logical parameters under the same local
+    model FQN. DCP otherwise merges those entries as replicas of one tensor.
+    """
+    fqn_to_checkpoint_fqn = {}
+    namespaced_model_state_dict = {}
+    for fqn, value in model_state_dict.items():
+        namespace = _mesh_namespace(value) if isinstance(value, DTensor) else None
+        checkpoint_fqn = f"{namespace}.{fqn}" if namespace is not None else fqn
+        if checkpoint_fqn in namespaced_model_state_dict:
+            raise ValueError(f"Duplicate checkpoint model key: {checkpoint_fqn}")
+        namespaced_model_state_dict[checkpoint_fqn] = value
+        fqn_to_checkpoint_fqn[fqn] = checkpoint_fqn
+
+    optimizer_state = optimizer_state_dict.get("state")
+    if isinstance(optimizer_state, dict):
+        namespaced_optimizer_state = {}
+        for fqn, value in optimizer_state.items():
+            checkpoint_fqn = fqn_to_checkpoint_fqn.get(fqn, fqn)
+            if checkpoint_fqn in namespaced_optimizer_state:
+                raise ValueError(f"Duplicate checkpoint optimizer key: {checkpoint_fqn}")
+            namespaced_optimizer_state[checkpoint_fqn] = value
+        optimizer_state_dict["state"] = namespaced_optimizer_state
+
+    return namespaced_model_state_dict, optimizer_state_dict, fqn_to_checkpoint_fqn
+
+
+def _remove_submesh_namespaces(
+    model_state_dict: dict, optimizer_state_dict: dict, fqn_to_checkpoint_fqn: dict[str, str]
+) -> tuple[dict, dict]:
+    """Restore model FQNs after loading a mesh-namespaced DCP state dict."""
+    checkpoint_fqn_to_fqn = {
+        checkpoint_fqn: fqn for fqn, checkpoint_fqn in fqn_to_checkpoint_fqn.items()
+    }
+    model_state_dict = {
+        checkpoint_fqn_to_fqn.get(fqn, fqn): value for fqn, value in model_state_dict.items()
+    }
+    optimizer_state = optimizer_state_dict.get("state")
+    if isinstance(optimizer_state, dict):
+        optimizer_state_dict["state"] = {
+            checkpoint_fqn_to_fqn.get(fqn, fqn): value for fqn, value in optimizer_state.items()
+        }
+    return model_state_dict, optimizer_state_dict
+
+
 def _optimizer_state_schema(state: dict) -> dict:
     """Convert one optimizer state to rank-portable construction metadata."""
     schema = {}
@@ -229,6 +290,9 @@ def save_checkpoint(
     model_state_dict = get_model_state_dict(model)
     optimizer_state_dict = _get_preprocessed_optimizer_state_dict(model, optimizer)
     preprocess_state_dict_for_uneven_dtensor(model_state_dict)
+    model_state_dict, optimizer_state_dict, _ = _namespace_submesh_state_dicts(
+        model_state_dict, optimizer_state_dict
+    )
 
     state_dict = {"model": model_state_dict, "optimizer": optimizer_state_dict}
     if extra_state:
@@ -273,6 +337,9 @@ def load_checkpoint(
         optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
         preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
         preprocess_state_dict_for_uneven_dtensor(model_state_dict)
+        model_state_dict, optimizer_state_dict, fqn_to_checkpoint_fqn = (
+            _namespace_submesh_state_dicts(model_state_dict, optimizer_state_dict)
+        )
 
         state_dict = {"model": model_state_dict, "optimizer": optimizer_state_dict}
         if extra_state:
@@ -281,6 +348,9 @@ def load_checkpoint(
                 raise ValueError(f"extra_state contains reserved keys: {sorted(overlap)}")
             state_dict.update(extra_state)
         dcp.load(state_dict, checkpoint_id=checkpoint_dir)
+        model_state_dict, optimizer_state_dict = _remove_submesh_namespaces(
+            model_state_dict, optimizer_state_dict, fqn_to_checkpoint_fqn
+        )
         set_model_state_dict(model, model_state_dict)
         set_optimizer_state_dict(
             model, optimizer, optimizer_state_dict, options=StateDictOptions(strict=False)
