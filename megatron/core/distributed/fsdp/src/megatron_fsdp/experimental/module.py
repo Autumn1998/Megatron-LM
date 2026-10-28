@@ -31,6 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
+from .dbuffer import DBuffer
 from .execution_order import ExecutionOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
@@ -481,7 +482,11 @@ class FsdpModule:
             # the reduce-scatter stream falls back to a raw cudaMalloc, which is
             # illegal during capture. Later modules are covered by the post-copy
             # fork each preceding module issues before its collective.
-            context.reduce_scatter_stream.wait_stream(current_stream)
+            context.inner_reduction_stream.wait_stream(current_stream)
+            # The DP-outer reduction stream needs no fork here: it never allocates (the
+            # finalize reuses the persistent main_grad and its view), and it joins any
+            # capture via its wait on the reduce-scatter stream before each finalize in
+            # _reduce_gradient_groups.
 
         self.unshard(Phase.BACKWARD, prefetch=True)
 
@@ -494,39 +499,55 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
-        """Pack gradients and immediately launch their reduce-scatters."""
+        """Pack gradients and launch their reductions.
+
+        When overlap is enabled, the last-microbatch DP-outer reduction runs on its
+        own stream so a group's DP-outer reduction overlaps the next group's DP-inner
+        reduction; otherwise both share the reduce-scatter stream and stay serialized.
+        """
         with self._nvtx_range("reduce_gradients"):
             context = self.context
-            reduce_scatter_stream = context.reduce_scatter_stream
+            inner_reduction_stream = context.inner_reduction_stream
             current_stream = context.current_stream()
 
             for group in self._parameter_groups:
                 if not group.requires_grad:
                     continue
 
+                partial_grad: DBuffer | None
                 if group.has_fused_wgrad:
                     # TE already wrote the fused wgrads into this buffer on the current stream,
                     # which allocated it in prepare_fused_grad_buffer().
-                    current_stream.wait_stream(reduce_scatter_stream)
+                    current_stream.wait_stream(inner_reduction_stream)
                     context.release_fused_grad_buffers()
                     partial_grad = group.take_fused_grad_buffer()
                 else:
-                    with torch.cuda.stream(reduce_scatter_stream):
+                    with torch.cuda.stream(inner_reduction_stream):
                         partial_grad = group.allocate_partial_grad_buffer()
 
-                    current_stream.wait_stream(reduce_scatter_stream)
+                    current_stream.wait_stream(inner_reduction_stream)
                     context.release_fused_grad_buffers()
                     group.copy_gradients_to_partial_buffer(partial_grad)
 
-                reduce_scatter_stream.wait_stream(current_stream)
-                with torch.cuda.stream(reduce_scatter_stream):
-                    group.reduce_partial_gradients(
-                        partial_grad, is_last_microbatch=self.context.is_last_microbatch
-                    )
+                inner_reduction_stream.wait_stream(current_stream)
+                with torch.cuda.stream(inner_reduction_stream):
+                    group.reduce_inner_gradients(partial_grad)
                 if group.has_fused_wgrad:
                     # Allocated on the current stream: keep it until that stream has waited for
                     # this reduce-scatter, at the next reduction or in finish_grad_sync().
+                    assert partial_grad is not None
                     context.defer_fused_grad_buffer(partial_grad)
+                if not context.is_last_microbatch:
+                    continue
+                # Finalize the DP-outer reduction. When overlap is enabled its stream is
+                # distinct, so it overlaps the following group's DP-inner reduce; the
+                # persistent accumulator and its optimizer-layout view stay alive across
+                # the handoff. When disabled the stream aliases inner_reduction_stream and
+                # this stays serialized.
+                if context.outer_reduction_stream is not inner_reduction_stream:
+                    context.outer_reduction_stream.wait_stream(inner_reduction_stream)
+                with torch.cuda.stream(context.outer_reduction_stream):
+                    group.reduce_outer_gradients()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
