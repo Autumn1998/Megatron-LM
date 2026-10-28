@@ -291,7 +291,9 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
+        # A checkpointed region recomputes all of its modules before the first of them starts
+        # its backward, so fused gradient buffers are left to each module's pre_backward().
+        self._unshard(Phase.FORWARD, prefetch=not is_recomputing, prepare_fused_grad_buffers=False)
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -307,9 +309,25 @@ class FsdpModule:
         ``context.allgather_stream.wait_stream(context.current_stream())``
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
+
+        Called during backward, this also allocates the gradient buffers that Transformer
+        Engine layers built with ``fuse_wgrad_accumulation=True`` write into, so call it when
+        this module's backward starts; ``_reduce_gradient_groups()`` consumes the buffers.
         """
+        self._unshard(phase, prefetch, prepare_fused_grad_buffers=_is_in_backward())
+
+    def _unshard(
+        self, phase: Phase | None, prefetch: bool, *, prepare_fused_grad_buffers: bool
+    ) -> None:
+        """Unshard parameter groups, optionally preparing this backward's fused buffers."""
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups(phase)
+            if prepare_fused_grad_buffers:
+                # TE reads weight.main_grad when each fused linear's backward starts, so this
+                # backward's reduce-scatter input must exist first. Preparing before the wait
+                # below lets the zeroing overlap the all-gather.
+                for group in self._parameter_groups:
+                    group.prepare_fused_grad_buffer()
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
             phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
@@ -486,17 +504,29 @@ class FsdpModule:
                 if not group.requires_grad:
                     continue
 
-                with torch.cuda.stream(reduce_scatter_stream):
-                    partial_grad = group.allocate_partial_grad_buffer()
+                if group.has_fused_wgrad:
+                    # TE already wrote the fused wgrads into this buffer on the current stream,
+                    # which allocated it in prepare_fused_grad_buffer().
+                    current_stream.wait_stream(reduce_scatter_stream)
+                    context.release_fused_grad_buffers()
+                    partial_grad = group.take_fused_grad_buffer()
+                else:
+                    with torch.cuda.stream(reduce_scatter_stream):
+                        partial_grad = group.allocate_partial_grad_buffer()
 
-                current_stream.wait_stream(reduce_scatter_stream)
-                group.copy_gradients_to_partial_buffer(partial_grad)
+                    current_stream.wait_stream(reduce_scatter_stream)
+                    context.release_fused_grad_buffers()
+                    group.copy_gradients_to_partial_buffer(partial_grad)
 
                 reduce_scatter_stream.wait_stream(current_stream)
                 with torch.cuda.stream(reduce_scatter_stream):
                     group.reduce_partial_gradients(
                         partial_grad, is_last_microbatch=self.context.is_last_microbatch
                     )
+                if group.has_fused_wgrad:
+                    # Allocated on the current stream: keep it until that stream has waited for
+                    # this reduce-scatter, at the next reduction or in finish_grad_sync().
+                    context.defer_fused_grad_buffer(partial_grad)
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

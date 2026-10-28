@@ -329,3 +329,22 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
     torch.testing.assert_close(losses, expected_losses, rtol=0, atol=0)
     torch.testing.assert_close(grads, expected_grads, rtol=0, atol=0)
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
+)
+def test_fused_wgrad_rejects_mxfp8_parameters(distributed_setup):
+    """MFSDP v2 does not yet support TE wgrad fusion for MXFP8 parameters."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    with te.quantized_model_init(recipe=MXFP8BlockScaling(), preserve_high_precision_init_val=True):
+        model = te.Linear(128, 128, bias=False, device=device, fuse_wgrad_accumulation=True)
+    placements = Placements(
+        dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
+    with fully_shard_context(device=device):
+        with pytest.raises(ValueError, match="MXFP8"):
+            fully_shard(model, mesh=mesh, placements=placements)
