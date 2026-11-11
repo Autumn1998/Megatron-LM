@@ -134,6 +134,11 @@ class FsdpParameterGroup:
     # With fuse_wgrad_accumulation, the reduce-scatter input of the next or current backward,
     # allocated before that backward starts. None otherwise.
     partial_grad: DBuffer | None
+    # Fused wgrads without an inner reduction (e.g. experts with DP-inner size 1) go straight
+    # into main_grad unscaled; grad_scale is applied once when gradients are finalized.
+    fuse_wgrad_into_main_grad: bool
+    # Whether main_grad holds scaled, finalized gradients that later backwards accumulate onto.
+    _fused_main_grad_is_scaled: bool
 
     def __init__(
         self,
@@ -190,6 +195,8 @@ class FsdpParameterGroup:
             for fqn in fqns
         )
         self.partial_grad = None
+        self.fuse_wgrad_into_main_grad = False
+        self._fused_main_grad_is_scaled = False
         parameters = tuple(parameter_to_fqns)
 
         if parameter_to_owner is not None and _contains_any_placement_type(
@@ -405,6 +412,13 @@ class FsdpParameterGroup:
             device=self.main_weight.device,
         )
         self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
+        # main_grad then holds full tensors, so TE can accumulate into its views directly
+        # instead of into a reduce-scatter buffer that would only be copied back.
+        self.fuse_wgrad_into_main_grad = (
+            self.fuse_wgrad_accumulation
+            and not self.requires_inner_reduction
+            and self.main_grad.local_buffer.numel() == self.main_grad.layout.size
+        )
 
     def _build_fsdp_parameters(
         self, parameter_to_fqns: dict[nn.Parameter, list[str]]
@@ -659,6 +673,43 @@ class FsdpParameterGroup:
         assert self.partial_grad is not None
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             fsdp_parameter.unsharded.main_grad = self.partial_grad.get_tensor_view(index)
+
+    def bind_main_grad(self) -> None:
+        """Expose main_grad's views as each parameter's ``main_grad`` for TE to accumulate into.
+
+        The step's first backward clears main_grad, since TE accumulates. TE writes unscaled
+        gradients and scale_fused_main_grad() applies grad_scale once at finalization.
+        """
+        assert self.main_grad is not None
+        if self._main_grad_is_stale or not self._has_sharded_grads():
+            self.main_grad.local_buffer.zero_()
+            self._main_grad_is_stale = False
+            # Later backwards of this step see sharded grads and accumulate.
+            self._install_sharded_grads(self.main_grad)
+        elif self._fused_main_grad_is_scaled and self.grad_scale != 1:
+            # Finalized without a DP-outer reduction and accumulated onto: unscale so that
+            # the next finalization scales every contribution exactly once.
+            self.main_grad.local_buffer.div_(self.grad_scale)
+        self._fused_main_grad_is_scaled = False
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            fsdp_parameter.unsharded.main_grad = self.main_grad.get_tensor_view(index)
+
+    def accumulate_unfused_gradients(self) -> None:
+        """Add the unscaled gradients autograd still returns (e.g. biases, LayerNorm weights)
+        to main_grad, where TE already wrote the fused ones, and drop main_grad."""
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            parameter = fsdp_parameter.unsharded
+            del parameter.main_grad
+            if parameter.grad is not None:
+                self.main_grad.get_tensor_view(index).add_(parameter.grad)
+            parameter.grad = None
+
+    def scale_fused_main_grad(self) -> None:
+        """Apply grad_scale once to the finalized gradients that TE accumulated unscaled."""
+        assert self.pre_optimizer_main_grad is not None
+        if self.grad_scale != 1:
+            self.pre_optimizer_main_grad.local_buffer.mul_(self.grad_scale)
+        self._fused_main_grad_is_scaled = True
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients on compute into the reduce-scatter input buffer.

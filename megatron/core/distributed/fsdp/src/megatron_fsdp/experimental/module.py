@@ -369,7 +369,9 @@ class FsdpModule:
         groups = [
             group
             for group in self._parameter_groups
-            if group.fuse_wgrad_accumulation and group.partial_grad is None
+            if group.fuse_wgrad_accumulation
+            and not group.fuse_wgrad_into_main_grad
+            and group.partial_grad is None
         ]
         if not groups:
             return
@@ -461,8 +463,11 @@ class FsdpModule:
         if self._partial_grad_event is not None:
             current_stream.wait_event(self._partial_grad_event)
             for group in self._parameter_groups:
-                if group.fuse_wgrad_accumulation:
+                if group.fuse_wgrad_accumulation and not group.fuse_wgrad_into_main_grad:
                     group.bind_partial_grad()
+        for group in self._parameter_groups:
+            if group.fuse_wgrad_into_main_grad:
+                group.bind_main_grad()
         # Allocate the next module's while prefetching, ahead of this module's reduce-scatter, so
         # that it is freed right after its own. unshard() advanced the order to that module.
         if prefetch:
@@ -498,8 +503,10 @@ class FsdpModule:
                 if not group.requires_grad:
                     continue
 
+                if group.fuse_wgrad_into_main_grad:
+                    self._accumulate_fused_gradients(group)
                 # TE needs partial_grad to write into even without an inner reduction.
-                if group.requires_inner_reduction or group.fuse_wgrad_accumulation:
+                elif group.requires_inner_reduction or group.fuse_wgrad_accumulation:
                     self._reduce_inner_gradients(group)
                 else:
                     self._accumulate_local_gradients(group)
@@ -515,6 +522,14 @@ class FsdpModule:
                     context.outer_reduction_stream.wait_stream(inner_reduction_stream)
                 with torch.cuda.stream(context.outer_reduction_stream):
                     group.reduce_outer_gradients()
+                    if group.fuse_wgrad_into_main_grad:
+                        group.scale_fused_main_grad()
+
+    def _accumulate_fused_gradients(self, group: FsdpParameterGroup) -> None:
+        """Add autograd's remaining gradients on compute; TE already wrote the fused ones."""
+        group.accumulate_unfused_gradients()
+        # Order the outer reduction and finish_grad_sync() after TE's writes on compute.
+        self.context.inner_reduction_stream.wait_stream(self.context.current_stream())
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
         """Accumulate on compute without waiting for other groups' inner reductions."""
