@@ -671,6 +671,9 @@ class FsdpParameterGroup:
             if self._main_grad_is_stale or not self._has_sharded_grads():
                 buffer.local_buffer.zero_()
                 self._main_grad_is_stale = False
+                if self._has_sharded_grads():
+                    # .grad still points at the optimizer view of the last finalization.
+                    self._install_sharded_grads(buffer)
             elif self._main_grad_is_scaled:
                 # Accumulating on top of a finalized total: undo its scaling.
                 buffer.local_buffer.div_(self.grad_scale)
@@ -704,16 +707,17 @@ class FsdpParameterGroup:
         this call and orders any outer reduction after the accumulation.
         """
         assert self.main_grad is not None
+        has_sharded_grads = self._has_sharded_grads()
         if self.fuse_wgrad_accumulation:
             # TE already accumulated the fused wgrads into main_grad, unscaled (bind_main_grad()).
             self.copy_gradients_to_partial_buffer(self.main_grad)
-            self._install_sharded_grads(self.main_grad)
+            if not has_sharded_grads:
+                self._install_sharded_grads(self.main_grad)
             return
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
 
-        has_sharded_grads = self._has_sharded_grads()
         self._clear_stale_main_grad()
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
@@ -726,7 +730,8 @@ class FsdpParameterGroup:
                 destination.copy_(grad)
                 if self.grad_scale != 1:
                     destination.mul_(self.grad_scale)
-        self._install_sharded_grads(self.main_grad)
+        if not has_sharded_grads:
+            self._install_sharded_grads(self.main_grad)
 
     def _has_sharded_grads(self) -> bool:
         """Whether installed .grad views select accumulation instead of overwrite.
@@ -759,6 +764,8 @@ class FsdpParameterGroup:
         # every parameter's gradient and no clearing is needed.
         if self._has_sharded_grads():
             self.main_grad.local_buffer.zero_()
+            # Accumulate through main_grad's views from now on, not the optimizer's.
+            self._install_sharded_grads(self.main_grad)
         # Later microbatches must preserve the contributions already accumulated.
         self._main_grad_is_stale = False
 
@@ -795,7 +802,8 @@ class FsdpParameterGroup:
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
-        self._install_sharded_grads(self.main_grad)
+        if not has_sharded_grads:
+            self._install_sharded_grads(self.main_grad)
 
     def reduce_outer_gradients(self) -> None:
         """Finalize the deferred DP-outer reduction into the optimizer-layout view.
